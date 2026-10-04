@@ -1,0 +1,185 @@
+# Build an UNSIGNED iPhone/iPad app of Zero Hour that contains NO game assets.
+#
+# Lets you build the iOS port without owning a Mac or a paid Apple Developer account:
+# the free GitHub macOS runner compiles everything, and a sideloading tool on your own
+# PC (e.g. Sideloadly with a free Apple ID) signs the .ipa when installing it. Your own
+# game files (Steam) are added to the .ipa locally and are never uploaded here.
+#
+# Output: workflow artifact "GeneralsZH-iOS-unsigned-noassets" (one .ipa).
+name: Build iOS (unsigned, no game assets)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/build-ios-unsigned.yml
+      - scripts/build/ios/package-ios-unsigned.sh
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-ios-unsigned-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-ios:
+    name: iOS arm64 (unsigned .ipa)
+    runs-on: macos-26
+    timeout-minutes: 330
+    defaults:
+      run:
+        shell: bash
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      HOMEBREW_NO_INSTALL_CLEANUP: "1"
+      VCPKG_DISABLE_METRICS: "1"
+      CCACHE_MAXSIZE: 1500M
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      # The iOS DXVK is built from this fork + Patches/dxvk-ios.patch. Its own submodules
+      # (Vulkan/SPIR-V/DirectX headers, libdisplay-info) are needed by its Meson build.
+      - name: Fetch DXVK fork submodule
+        run: |
+          git submodule update --init references/fbraz3-dxvk
+          git -C references/fbraz3-dxvk submodule update --init --recursive
+          git -C references/fbraz3-dxvk log -1 --format='DXVK fork at %h %s'
+
+      - name: Runner info and free disk space
+        run: |
+          sw_vers
+          xcodebuild -version
+          echo "iPhoneOS SDK $(xcrun --sdk iphoneos --show-sdk-version)"
+          df -h "$HOME"
+          # Large preinstalled SDKs this build never uses; only worth the minutes if space is tight
+          if [ "$(df -g "$HOME" | awk 'NR == 2 { print $4 }')" -lt 40 ]; then
+            sudo rm -rf "$HOME/Library/Android" "$HOME/.dotnet" /usr/local/share/dotnet "$RUNNER_TOOL_CACHE/CodeQL" || true
+            df -h "$HOME"
+          fi
+
+      - name: Install build tools
+        run: |
+          brew install cmake ninja meson pkgconf xcodegen glslang ccache \
+            autoconf autoconf-archive automake libtool
+          for tool in cmake ninja meson pkg-config xcodegen glslangValidator ccache; do
+            printf '%-17s %s\n' "$tool" "$(command -v "$tool")"
+          done
+          cmake --version | head -1
+
+      # Full clone: the manifest's builtin-baseline and version overrides need vcpkg history.
+      - name: Set up vcpkg
+        run: |
+          git clone https://github.com/microsoft/vcpkg.git "$HOME/vcpkg"
+          "$HOME/vcpkg/bootstrap-vcpkg.sh" -disableMetrics
+          mkdir -p "$HOME/.cache/vcpkg-bin" "$HOME/.cache/ccache"
+          {
+            echo "VCPKG_ROOT=$HOME/vcpkg"
+            echo "VCPKG_DEFAULT_BINARY_CACHE=$HOME/.cache/vcpkg-bin"
+            echo "CCACHE_DIR=$HOME/.cache/ccache"
+          } >> "$GITHUB_ENV"
+
+      - name: Restore vcpkg binary cache
+        uses: actions/cache/restore@v5
+        with:
+          path: ~/.cache/vcpkg-bin
+          key: vcpkg-arm64-ios-${{ hashFiles('vcpkg.json', 'cmake/triplets/arm64-ios.cmake') }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: vcpkg-arm64-ios-${{ hashFiles('vcpkg.json', 'cmake/triplets/arm64-ios.cmake') }}-
+
+      - name: Restore ccache
+        uses: actions/cache/restore@v5
+        with:
+          path: ~/.cache/ccache
+          key: ccache-ios-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: ccache-ios-
+
+      # MoltenVK v1.4.1 (pinned + checksummed by fetch-moltenvk.sh) provides everything the
+      # ios-vulkan preset reads from $VULKAN_SDK: Vulkan + MoltenVK headers and the static
+      # ios-arm64 libMoltenVK.a. Its dynamic framework is what DXVK dlopens on the device.
+      - name: Stage MoltenVK and fonts
+        run: |
+          ./scripts/build/ios/fetch-moltenvk.sh
+          ./scripts/build/ios/stage-fonts.sh
+          MVK="$HOME/GeneralsX/MoltenVK/MoltenVK/MoltenVK"
+          SDK="$HOME/vulkan-sdk-ios"
+          mkdir -p "$SDK/lib"
+          ln -sfn "$MVK/include" "$SDK/include"
+          ln -sfn "$MVK/static/MoltenVK.xcframework" "$SDK/lib/MoltenVK.xcframework"
+          ls -l "$SDK/lib/MoltenVK.xcframework/ios-arm64/libMoltenVK.a" \
+                "$SDK/include/vulkan/vulkan.h" "$SDK/include/MoltenVK/mvk_vulkan.h"
+          echo "VULKAN_SDK=$SDK" >> "$GITHUB_ENV"
+
+      - name: Configure (ios-vulkan preset, builds vcpkg deps for arm64-ios)
+        run: |
+          mkdir -p logs
+          cmake --preset ios-vulkan -DVCPKG_INSTALL_OPTIONS=--clean-after-build 2>&1 | tee logs/configure.log
+
+      - name: Build z_generals
+        run: |
+          ccache -z || true
+          cmake --build build/ios-vulkan --target z_generals -j "$(sysctl -n hw.ncpu)" 2>&1 | tee logs/build.log
+          ccache -s || true
+
+      - name: Verify iOS binaries
+        run: |
+          B=build/ios-vulkan
+          check_ios() {
+            file "$1"
+            otool -l "$1" | grep -A3 LC_BUILD_VERSION | grep -q 'platform 2' \
+              || { echo "::error::$1 is not an iOS (platform 2) binary"; exit 1; }
+          }
+          check_ios "$B/GeneralsMD/GeneralsXZH.app/GeneralsXZH"
+          check_ios "$B/_deps/dxvk-build-macos/src/d3d8/libdxvk_d3d8.0.dylib"
+          check_ios "$B/_deps/dxvk-build-macos/src/d3d9/libdxvk_d3d9.0.dylib"
+          # A DXVK built without the SDL3 WSI cannot drive the game's window (black screen)
+          strings "$B/_deps/dxvk-build-macos/src/d3d9/libdxvk_d3d9.0.dylib" | grep -q Sdl3WsiDriver \
+            || { echo "::error::libdxvk_d3d9 was built without the SDL3 WSI driver"; exit 1; }
+          echo "iOS binaries OK"
+
+      - name: Package unsigned .ipa (no game assets)
+        run: ./scripts/build/ios/package-ios-unsigned.sh 2>&1 | tee logs/package.log
+
+      - name: Upload .ipa
+        uses: actions/upload-artifact@v7
+        with:
+          name: GeneralsZH-iOS-unsigned-noassets
+          path: build/ios-package/*.ipa
+          compression-level: 0
+          if-no-files-found: error
+
+      - name: Save vcpkg binary cache
+        if: always()
+        uses: actions/cache/save@v5
+        with:
+          path: ~/.cache/vcpkg-bin
+          key: vcpkg-arm64-ios-${{ hashFiles('vcpkg.json', 'cmake/triplets/arm64-ios.cmake') }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Save ccache
+        if: always()
+        uses: actions/cache/save@v5
+        with:
+          path: ~/.cache/ccache
+          key: ccache-ios-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Collect logs
+        if: failure()
+        run: |
+          mkdir -p logs/vcpkg
+          df -h "$HOME" > logs/disk.txt || true
+          cp build/ios-vulkan/vcpkg-manifest-install.log logs/ 2>/dev/null || true
+          cp build/ios-vulkan/CMakeFiles/CMakeConfigureLog.yaml logs/ 2>/dev/null || true
+          cp -R build/ios-vulkan/_deps/dxvk-build-macos/meson-logs logs/dxvk-meson-logs 2>/dev/null || true
+          find "$HOME/vcpkg/buildtrees" -maxdepth 2 -name '*.log' -exec cp {} logs/vcpkg/ \; 2>/dev/null || true
+
+      - name: Upload logs
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: build-logs
+          path: logs/
+          if-no-files-found: ignore
