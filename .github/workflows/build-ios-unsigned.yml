@@ -128,16 +128,20 @@ jobs:
       - name: Verify iOS binaries
         run: |
           B=build/ios-vulkan
+          # No `| grep -q` here: grep -q quits at the first match, the writer gets SIGPIPE,
+          # and pipefail turns a successful match into a failure.
           check_ios() {
             file "$1"
-            otool -l "$1" | grep -A3 LC_BUILD_VERSION | grep -q 'platform 2' \
+            local build_version
+            build_version="$(otool -l "$1" | grep -A3 LC_BUILD_VERSION)"
+            [[ "$build_version" == *"platform 2"* ]] \
               || { echo "::error::$1 is not an iOS (platform 2) binary"; exit 1; }
           }
           check_ios "$B/GeneralsMD/GeneralsXZH.app/GeneralsXZH"
           check_ios "$B/_deps/dxvk-build-macos/src/d3d8/libdxvk_d3d8.0.dylib"
           check_ios "$B/_deps/dxvk-build-macos/src/d3d9/libdxvk_d3d9.0.dylib"
           # A DXVK built without the SDL3 WSI cannot drive the game's window (black screen)
-          strings "$B/_deps/dxvk-build-macos/src/d3d9/libdxvk_d3d9.0.dylib" | grep -q Sdl3WsiDriver \
+          grep -q -a Sdl3WsiDriver "$B/_deps/dxvk-build-macos/src/d3d9/libdxvk_d3d9.0.dylib" \
             || { echo "::error::libdxvk_d3d9 was built without the SDL3 WSI driver"; exit 1; }
           echo "iOS binaries OK"
 
